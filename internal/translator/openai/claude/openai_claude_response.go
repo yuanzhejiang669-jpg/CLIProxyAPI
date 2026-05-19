@@ -8,6 +8,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"sort"
 	"strings"
 
@@ -114,14 +115,14 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 
 	// Check if this is the [DONE] marker
 	if bytes.Equal(bytes.TrimSpace(rawJSON), []byte("[DONE]")) {
-		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+		return convertOpenAIDoneToAnthropic(originalRequestRawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 
 	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
 	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
+		return convertOpenAINonStreamingToAnthropic(originalRequestRawJSON, rawJSON)
 	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+		return convertOpenAIStreamingChunkToAnthropic(originalRequestRawJSON, rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 }
 
@@ -136,7 +137,7 @@ func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) 
 }
 
 // convertOpenAIStreamingChunkToAnthropic converts OpenAI streaming chunk to Anthropic streaming events
-func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAIResponseToAnthropicParams) [][]byte {
+func convertOpenAIStreamingChunkToAnthropic(originalRequestRawJSON, rawJSON []byte, param *ConvertOpenAIResponseToAnthropicParams) [][]byte {
 	root := gjson.ParseBytes(rawJSON)
 	var results [][]byte
 
@@ -319,7 +320,8 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				if accumulator.Arguments.Len() > 0 {
 					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+					arguments := sanitizeOpenAIClaudeToolArguments(originalRequestRawJSON, accumulator.Name, util.FixJSON(accumulator.Arguments.String()))
+					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", arguments)
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 				}
 
@@ -360,7 +362,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 }
 
 // convertOpenAIDoneToAnthropic handles the [DONE] marker and sends final events
-func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams) [][]byte {
+func convertOpenAIDoneToAnthropic(originalRequestRawJSON []byte, param *ConvertOpenAIResponseToAnthropicParams) [][]byte {
 	var results [][]byte
 
 	// Ensure all content blocks are stopped before final events
@@ -390,7 +392,8 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			if accumulator.Arguments.Len() > 0 {
 				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+				arguments := sanitizeOpenAIClaudeToolArguments(originalRequestRawJSON, accumulator.Name, util.FixJSON(accumulator.Arguments.String()))
+				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", arguments)
 				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 			}
 
@@ -416,8 +419,9 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 }
 
 // convertOpenAINonStreamingToAnthropic converts OpenAI non-streaming response to Anthropic format
-func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
+func convertOpenAINonStreamingToAnthropic(originalRequestRawJSON, rawJSON []byte) [][]byte {
 	root := gjson.ParseBytes(rawJSON)
+	toolNameMap := util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
 
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	out, _ = sjson.SetBytes(out, "id", root.Get("id").String())
@@ -449,9 +453,10 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
-				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
+				toolName := util.MapToolName(toolNameMap, toolCall.Get("function.name").String())
+				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolName)
 
-				argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
+				argsStr := sanitizeOpenAIClaudeToolArguments(originalRequestRawJSON, toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
 				if argsStr != "" && gjson.Valid(argsStr) {
 					argsJSON := gjson.Parse(argsStr)
 					if argsJSON.IsObject() {
@@ -502,6 +507,93 @@ func mapOpenAIFinishReasonToAnthropic(openAIReason string) string {
 		return "tool_use"
 	default:
 		return "end_turn"
+	}
+}
+
+func sanitizeOpenAIClaudeToolArguments(originalRequestRawJSON []byte, name, arguments string) string {
+	if arguments == "" || !gjson.Valid(arguments) {
+		return arguments
+	}
+	argsResult := gjson.Parse(arguments)
+	if !argsResult.IsObject() {
+		return arguments
+	}
+
+	var args any
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+		return arguments
+	}
+	cleaned := sanitizeOpenAIClaudeJSONValueWithSchema(args, openAIClaudeToolInputSchema(originalRequestRawJSON, name), true)
+	cleanedRaw, err := json.Marshal(cleaned)
+	if err != nil {
+		return arguments
+	}
+	return string(cleanedRaw)
+}
+
+func openAIClaudeToolInputSchema(originalRequestRawJSON []byte, name string) gjson.Result {
+	tools := gjson.GetBytes(originalRequestRawJSON, "tools")
+	if !tools.IsArray() {
+		return gjson.Result{}
+	}
+	var schema gjson.Result
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		if tool.Get("name").String() != name {
+			return true
+		}
+		schema = tool.Get("input_schema")
+		return false
+	})
+	return schema
+}
+
+func sanitizeOpenAIClaudeJSONValueWithSchema(value any, schema gjson.Result, required bool) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		requiredFields := map[string]struct{}{}
+		if requiredResult := schema.Get("required"); requiredResult.IsArray() {
+			requiredResult.ForEach(func(_, item gjson.Result) bool {
+				if name := item.String(); name != "" {
+					requiredFields[name] = struct{}{}
+				}
+				return true
+			})
+		}
+		properties := schema.Get("properties")
+		for key, childValue := range typed {
+			_, childRequired := requiredFields[key]
+			childSchema := properties.Get(key)
+			cleaned := sanitizeOpenAIClaudeJSONValueWithSchema(childValue, childSchema, childRequired)
+			if !childRequired && isEmptyOpenAIClaudeOptionalToolArgument(cleaned) {
+				delete(typed, key)
+				continue
+			}
+			typed[key] = cleaned
+		}
+		return typed
+	case []any:
+		itemSchema := schema.Get("items")
+		for i, item := range typed {
+			typed[i] = sanitizeOpenAIClaudeJSONValueWithSchema(item, itemSchema, true)
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func isEmptyOpenAIClaudeOptionalToolArgument(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return typed == ""
+	case []any:
+		return len(typed) == 0
+	case map[string]any:
+		return len(typed) == 0
+	default:
+		return false
 	}
 }
 
@@ -672,7 +764,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 									toolUse, _ = sjson.SetBytes(toolUse, "id", util.SanitizeClaudeToolID(tc.Get("id").String()))
 									toolUse, _ = sjson.SetBytes(toolUse, "name", util.MapToolName(toolNameMap, tc.Get("function.name").String()))
 
-									argsStr := util.FixJSON(tc.Get("function.arguments").String())
+									argsStr := sanitizeOpenAIClaudeToolArguments(originalRequestRawJSON, util.MapToolName(toolNameMap, tc.Get("function.name").String()), util.FixJSON(tc.Get("function.arguments").String()))
 									if argsStr != "" && gjson.Valid(argsStr) {
 										argsJSON := gjson.Parse(argsStr)
 										if argsJSON.IsObject() {
@@ -729,7 +821,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", util.MapToolName(toolNameMap, toolCall.Get("function.name").String()))
 
-					argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
+					argsStr := sanitizeOpenAIClaudeToolArguments(originalRequestRawJSON, util.MapToolName(toolNameMap, toolCall.Get("function.name").String()), util.FixJSON(toolCall.Get("function.arguments").String()))
 					if argsStr != "" && gjson.Valid(argsStr) {
 						argsJSON := gjson.Parse(argsStr)
 						if argsJSON.IsObject() {

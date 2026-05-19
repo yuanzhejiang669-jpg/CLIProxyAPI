@@ -600,6 +600,161 @@ func TestConvertCodexResponseToClaude_StreamStopSequenceMapping(t *testing.T) {
 	}
 }
 
+func TestConvertCodexResponseToClaude_StreamDefersFunctionCallWithEmptyAddedName(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{}}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":""}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","arguments":"{\"file_path\":\"README.md\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"README.md\"}"}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	toolStart, ok := findClaudeStreamToolUseStart(outputs)
+	if !ok {
+		t.Fatalf("did not find tool_use content_block_start; outputs=%q", outputs)
+	}
+	if got := toolStart.Get("content_block.name").String(); got != "Read" {
+		t.Fatalf("tool name = %q, want Read. Outputs=%q", got, outputs)
+	}
+
+	argsFound := false
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() != "content_block_delta" || data.Get("delta.type").String() != "input_json_delta" {
+				continue
+			}
+			if data.Get("delta.partial_json").String() == `{"file_path":"README.md"}` {
+				argsFound = true
+			}
+		}
+	}
+	if !argsFound {
+		t.Fatalf("did not find deferred function call arguments; outputs=%q", outputs)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamRemovesEmptyOptionalToolArguments(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"pages":{"type":"string"},"limit":{"type":"number"},"offset":{"type":"number"},"options":{"type":"object"},"tags":{"type":"array"}},"required":["file_path"]}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","arguments":"{\"file_path\":\"README.md\",\"pages\":\"\",\"limit\":2000,\"offset\":0,\"options\":{},\"tags\":[]}"}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"README.md\",\"pages\":\"\",\"limit\":2000,\"offset\":0,\"options\":{},\"tags\":[]}"}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	args, ok := findClaudeStreamToolArguments(outputs)
+	if !ok {
+		t.Fatalf("did not find tool argument delta; outputs=%q", outputs)
+	}
+	parsed := gjson.Parse(args)
+	if parsed.Get("pages").Exists() {
+		t.Fatalf("pages should be removed when empty optional; args=%s", args)
+	}
+	if parsed.Get("options").Exists() {
+		t.Fatalf("options should be removed when empty optional object; args=%s", args)
+	}
+	if parsed.Get("tags").Exists() {
+		t.Fatalf("tags should be removed when empty optional array; args=%s", args)
+	}
+	if got := parsed.Get("file_path").String(); got != "README.md" {
+		t.Fatalf("file_path = %q, want README.md; args=%s", got, args)
+	}
+	if got := parsed.Get("limit").Int(); got != 2000 {
+		t.Fatalf("limit = %d, want 2000; args=%s", got, args)
+	}
+	if got := parsed.Get("offset").Int(); got != 0 || !parsed.Get("offset").Exists() {
+		t.Fatalf("offset should be preserved as 0; args=%s", args)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamRemovesEmptyOptionalToolArgumentsWithoutSchema(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read"}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","arguments":"{\"file_path\":\"README.md\",\"pages\":\"\",\"limit\":2000,\"offset\":0}"}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"README.md\",\"pages\":\"\",\"limit\":2000,\"offset\":0}"}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	args, ok := findClaudeStreamToolArguments(outputs)
+	if !ok {
+		t.Fatalf("did not find tool argument delta; outputs=%q", outputs)
+	}
+	parsed := gjson.Parse(args)
+	if parsed.Get("pages").Exists() {
+		t.Fatalf("pages should be removed when empty even without schema; args=%s", args)
+	}
+	if got := parsed.Get("file_path").String(); got != "README.md" {
+		t.Fatalf("file_path = %q, want README.md; args=%s", got, args)
+	}
+	if got := parsed.Get("limit").Int(); got != 2000 {
+		t.Fatalf("limit = %d, want 2000; args=%s", got, args)
+	}
+	if got := parsed.Get("offset").Int(); got != 0 || !parsed.Get("offset").Exists() {
+		t.Fatalf("offset should be preserved as 0; args=%s", args)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamPreservesValidAndRequiredToolArguments(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"pages":{"type":"string"},"empty_required":{"type":"string"},"nested":{"type":"object","properties":{"optional":{"type":"string"},"required_child":{"type":"string"}},"required":["required_child"]}},"required":["file_path","empty_required"]}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","arguments":"{\"file_path\":\"README.md\",\"pages\":\"1-5\",\"empty_required\":\"\",\"nested\":{\"optional\":\"\",\"required_child\":\"\"}}"}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"README.md\",\"pages\":\"1-5\",\"empty_required\":\"\",\"nested\":{\"optional\":\"\",\"required_child\":\"\"}}"}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	args, ok := findClaudeStreamToolArguments(outputs)
+	if !ok {
+		t.Fatalf("did not find tool argument delta; outputs=%q", outputs)
+	}
+	parsed := gjson.Parse(args)
+	if got := parsed.Get("pages").String(); got != "1-5" {
+		t.Fatalf("pages = %q, want 1-5; args=%s", got, args)
+	}
+	if !parsed.Get("empty_required").Exists() || parsed.Get("empty_required").String() != "" {
+		t.Fatalf("required empty string should be preserved; args=%s", args)
+	}
+	if parsed.Get("nested.optional").Exists() {
+		t.Fatalf("nested optional empty string should be removed; args=%s", args)
+	}
+	if !parsed.Get("nested.required_child").Exists() || parsed.Get("nested.required_child").String() != "" {
+		t.Fatalf("nested required empty string should be preserved; args=%s", args)
+	}
+}
+
 func TestConvertCodexResponseToClaudeNonStream_StopReasonMapping(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -725,4 +880,37 @@ func findClaudeStreamMessageDelta(outputs [][]byte) (gjson.Result, bool) {
 		}
 	}
 	return gjson.Result{}, false
+}
+
+func findClaudeStreamToolUseStart(outputs [][]byte) (gjson.Result, bool) {
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() == "content_block_start" && data.Get("content_block.type").String() == "tool_use" {
+				return data, true
+			}
+		}
+	}
+	return gjson.Result{}, false
+}
+
+func findClaudeStreamToolArguments(outputs [][]byte) (string, bool) {
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() != "content_block_delta" || data.Get("delta.type").String() != "input_json_delta" {
+				continue
+			}
+			if args := data.Get("delta.partial_json").String(); args != "" {
+				return args, true
+			}
+		}
+	}
+	return "", false
 }

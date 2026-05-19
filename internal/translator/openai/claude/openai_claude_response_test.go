@@ -364,3 +364,112 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }
+
+func TestConvertOpenAIResponseToClaude_StreamRemovesEmptyOptionalToolArguments(t *testing.T) {
+	originalRequest := []byte(`{"stream":true,"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"pages":{"type":"string"},"limit":{"type":"number"},"offset":{"type":"number"}},"required":["file_path"]}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\","}}]},"finish_reason":null}]}`),
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pages\":\"\",\"limit\":2000,\"offset\":0}"}}]},"finish_reason":null}]}`),
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertOpenAIResponseToClaude(context.Background(), "test-model", originalRequest, nil, chunk, &param)...)
+	}
+
+	args, ok := findOpenAIClaudeStreamToolArguments(outputs)
+	if !ok {
+		t.Fatalf("did not find tool argument delta; outputs=%q", outputs)
+	}
+	parsed := gjson.Parse(args)
+	if parsed.Get("pages").Exists() {
+		t.Fatalf("pages should be removed when empty optional; args=%s", args)
+	}
+	if got := parsed.Get("file_path").String(); got != "README.md" {
+		t.Fatalf("file_path = %q, want README.md; args=%s", got, args)
+	}
+	if got := parsed.Get("limit").Int(); got != 2000 {
+		t.Fatalf("limit = %d, want 2000; args=%s", got, args)
+	}
+	if got := parsed.Get("offset").Int(); got != 0 || !parsed.Get("offset").Exists() {
+		t.Fatalf("offset should be preserved as 0; args=%s", args)
+	}
+}
+
+func TestConvertOpenAIResponseToClaude_StreamRemovesEmptyOptionalToolArgumentsWithoutSchema(t *testing.T) {
+	originalRequest := []byte(`{"stream":true,"tools":[{"name":"Read"}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\",\"pages\":\"\",\"limit\":2000,\"offset\":0}"}}]},"finish_reason":null}]}`),
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertOpenAIResponseToClaude(context.Background(), "test-model", originalRequest, nil, chunk, &param)...)
+	}
+
+	args, ok := findOpenAIClaudeStreamToolArguments(outputs)
+	if !ok {
+		t.Fatalf("did not find tool argument delta; outputs=%q", outputs)
+	}
+	parsed := gjson.Parse(args)
+	if parsed.Get("pages").Exists() {
+		t.Fatalf("pages should be removed when empty even without schema; args=%s", args)
+	}
+	if got := parsed.Get("offset").Int(); got != 0 || !parsed.Get("offset").Exists() {
+		t.Fatalf("offset should be preserved as 0; args=%s", args)
+	}
+}
+
+func TestConvertOpenAIResponseToClaude_StreamPreservesRequiredEmptyToolArguments(t *testing.T) {
+	originalRequest := []byte(`{"stream":true,"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"empty_required":{"type":"string"},"nested":{"type":"object","properties":{"optional":{"type":"string"},"required_child":{"type":"string"}},"required":["required_child"]}},"required":["file_path","empty_required"]}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\",\"empty_required\":\"\",\"nested\":{\"optional\":\"\",\"required_child\":\"\"}}"}}]},"finish_reason":null}]}`),
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertOpenAIResponseToClaude(context.Background(), "test-model", originalRequest, nil, chunk, &param)...)
+	}
+
+	args, ok := findOpenAIClaudeStreamToolArguments(outputs)
+	if !ok {
+		t.Fatalf("did not find tool argument delta; outputs=%q", outputs)
+	}
+	parsed := gjson.Parse(args)
+	if !parsed.Get("empty_required").Exists() || parsed.Get("empty_required").String() != "" {
+		t.Fatalf("required empty string should be preserved; args=%s", args)
+	}
+	if parsed.Get("nested.optional").Exists() {
+		t.Fatalf("nested optional empty string should be removed; args=%s", args)
+	}
+	if !parsed.Get("nested.required_child").Exists() || parsed.Get("nested.required_child").String() != "" {
+		t.Fatalf("nested required empty string should be preserved; args=%s", args)
+	}
+}
+
+func findOpenAIClaudeStreamToolArguments(outputs [][]byte) (string, bool) {
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() != "content_block_delta" || data.Get("delta.type").String() != "input_json_delta" {
+				continue
+			}
+			if args := data.Get("delta.partial_json").String(); args != "" {
+				return args, true
+			}
+		}
+	}
+	return "", false
+}
