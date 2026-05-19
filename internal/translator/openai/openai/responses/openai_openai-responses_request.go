@@ -203,7 +203,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				if output := item.Get("output"); output.Exists() {
-					toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
+					toolMessage = setResponsesFunctionCallOutputContent(toolMessage, output)
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
@@ -280,4 +280,168 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return out
+}
+
+func setResponsesFunctionCallOutputContent(toolMessage []byte, output gjson.Result) []byte {
+	switch {
+	case output.Type == gjson.String:
+		toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
+	case output.IsArray():
+		contentJSON, textContent, hasImage := convertResponsesFunctionCallOutputParts(output.Array())
+		if hasImage {
+			toolMessage, _ = sjson.SetRawBytes(toolMessage, "content", contentJSON)
+		} else {
+			toolMessage, _ = sjson.SetBytes(toolMessage, "content", textContent)
+		}
+	case output.IsObject():
+		contentJSON, textContent, hasImage := convertResponsesFunctionCallOutputParts([]gjson.Result{output})
+		if hasImage {
+			toolMessage, _ = sjson.SetRawBytes(toolMessage, "content", contentJSON)
+		} else {
+			toolMessage, _ = sjson.SetBytes(toolMessage, "content", textContent)
+		}
+	default:
+		toolMessage, _ = sjson.SetBytes(toolMessage, "content", responsesFunctionCallOutputText(output))
+	}
+	return toolMessage
+}
+
+func convertResponsesFunctionCallOutputParts(parts []gjson.Result) ([]byte, string, bool) {
+	contentJSON := []byte(`[]`)
+	textParts := make([]string, 0)
+	hasImage := false
+
+	for _, part := range parts {
+		chatPart, text, isImage := convertResponsesFunctionCallOutputPart(part)
+		if strings.TrimSpace(text) != "" {
+			textParts = append(textParts, text)
+		}
+		if len(chatPart) > 0 {
+			contentJSON, _ = sjson.SetRawBytes(contentJSON, "-1", chatPart)
+		}
+		if isImage {
+			hasImage = true
+		}
+	}
+
+	textContent := strings.Join(textParts, "\n\n")
+	if strings.TrimSpace(textContent) == "" && len(parts) > 0 {
+		rawParts := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if text := responsesFunctionCallOutputText(part); strings.TrimSpace(text) != "" {
+				rawParts = append(rawParts, text)
+			}
+		}
+		textContent = strings.Join(rawParts, "\n\n")
+	}
+	return contentJSON, textContent, hasImage
+}
+
+func convertResponsesFunctionCallOutputPart(part gjson.Result) ([]byte, string, bool) {
+	if part.Type == gjson.String {
+		text := part.String()
+		return responsesFunctionCallOutputTextPart(text), text, false
+	}
+
+	partType := part.Get("type").String()
+	if partType == "" && part.Get("text").Exists() {
+		partType = "input_text"
+	}
+
+	switch partType {
+	case "text", "input_text", "output_text":
+		text := part.Get("text").String()
+		return responsesFunctionCallOutputTextPart(text), text, false
+	case "image_url", "input_image":
+		if imagePart, ok := responsesFunctionCallOutputImagePart(part); ok {
+			return imagePart, "", true
+		}
+	case "image":
+		if imagePart, ok := responsesFunctionCallOutputClaudeImagePart(part); ok {
+			return imagePart, "", true
+		}
+	case "file", "input_file":
+		text := responsesFunctionCallOutputText(part)
+		return responsesFunctionCallOutputTextPart(text), text, false
+	}
+
+	text := responsesFunctionCallOutputText(part)
+	return responsesFunctionCallOutputTextPart(text), text, false
+}
+
+func responsesFunctionCallOutputTextPart(text string) []byte {
+	part := []byte(`{"type":"text","text":""}`)
+	part, _ = sjson.SetBytes(part, "text", text)
+	return part
+}
+
+func responsesFunctionCallOutputImagePart(part gjson.Result) ([]byte, bool) {
+	imageURL := ""
+	if v := part.Get("image_url"); v.Exists() {
+		if v.Type == gjson.String {
+			imageURL = v.String()
+		} else if v.IsObject() {
+			imageURL = v.Get("url").String()
+		}
+	}
+	if imageURL == "" {
+		imageURL = part.Get("url").String()
+	}
+
+	fileID := part.Get("file_id").String()
+	if fileID == "" {
+		fileID = part.Get("image_url.file_id").String()
+	}
+
+	if imageURL == "" && fileID == "" {
+		return nil, false
+	}
+
+	imagePart := []byte(`{"type":"image_url","image_url":{}}`)
+	if imageURL != "" {
+		imagePart, _ = sjson.SetBytes(imagePart, "image_url.url", imageURL)
+	}
+	if fileID != "" {
+		imagePart, _ = sjson.SetBytes(imagePart, "image_url.file_id", fileID)
+	}
+	if detail := part.Get("detail").String(); detail != "" {
+		imagePart, _ = sjson.SetBytes(imagePart, "image_url.detail", detail)
+	} else if detail := part.Get("image_url.detail").String(); detail != "" {
+		imagePart, _ = sjson.SetBytes(imagePart, "image_url.detail", detail)
+	}
+	return imagePart, true
+}
+
+func responsesFunctionCallOutputClaudeImagePart(part gjson.Result) ([]byte, bool) {
+	imageURL := part.Get("url").String()
+	if source := part.Get("source"); source.Exists() {
+		switch source.Get("type").String() {
+		case "base64":
+			mediaType := source.Get("media_type").String()
+			if mediaType == "" {
+				mediaType = "application/octet-stream"
+			}
+			if data := source.Get("data").String(); data != "" {
+				imageURL = "data:" + mediaType + ";base64," + data
+			}
+		case "url":
+			imageURL = source.Get("url").String()
+		}
+	}
+	if imageURL == "" {
+		return nil, false
+	}
+	imagePart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+	imagePart, _ = sjson.SetBytes(imagePart, "image_url.url", imageURL)
+	return imagePart, true
+}
+
+func responsesFunctionCallOutputText(output gjson.Result) string {
+	if output.Type == gjson.String {
+		return output.String()
+	}
+	if strings.TrimSpace(output.Raw) != "" {
+		return output.Raw
+	}
+	return output.String()
 }

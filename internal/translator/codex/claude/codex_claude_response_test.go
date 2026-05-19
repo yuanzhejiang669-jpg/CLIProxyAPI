@@ -470,7 +470,14 @@ func TestConvertCodexResponseToClaude_ShortensLongToolUseIDs(t *testing.T) {
 		originalRequest := []byte(`{"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{}}}]}`)
 		var param any
 
-		outputs := ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"`+longCallID+`","name":"lookup"}}`), &param)
+		chunks := [][]byte{
+			[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"` + longCallID + `","name":"lookup"}}`),
+			[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"` + longCallID + `","name":"lookup","arguments":"{}"}}`),
+		}
+		var outputs [][]byte
+		for _, chunk := range chunks {
+			outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+		}
 
 		toolID := ""
 		for _, out := range outputs {

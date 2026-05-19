@@ -162,8 +162,6 @@ func convertOpenAIStreamingChunkToAnthropic(originalRequestRawJSON, rawJSON []by
 			messageStartJSON, _ = sjson.SetBytes(messageStartJSON, "message.model", param.Model)
 			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_start", messageStartJSON, 2))
 			param.MessageStarted = true
-
-			// Don't send content_block_start for text here - wait for actual content
 		}
 
 		// Handle reasoning content delta

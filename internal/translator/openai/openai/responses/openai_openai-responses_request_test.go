@@ -122,3 +122,45 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
 		t.Fatalf("messages.3.content = %q, want %q", got, "next")
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesMultimodalFunctionCallOutput(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_read","name":"Read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_read","output":[
+				{"type":"input_text","text":"tool ok"},
+				{"type":"input_image","image_url":"data:image/png;base64,abc","detail":"high"}
+			]}
+		]
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.5", raw, true)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "tool" {
+		t.Fatalf("messages.1.role = %q, want tool", got)
+	}
+	if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != "call_read" {
+		t.Fatalf("messages.1.tool_call_id = %q, want call_read", got)
+	}
+	content := gjson.GetBytes(out, "messages.1.content")
+	if !content.IsArray() {
+		t.Fatalf("messages.1.content should be an array: %s", string(out))
+	}
+	if got := content.Get("0.type").String(); got != "text" {
+		t.Fatalf("content.0.type = %q, want text", got)
+	}
+	if got := content.Get("0.text").String(); got != "tool ok" {
+		t.Fatalf("content.0.text = %q, want tool ok", got)
+	}
+	if got := content.Get("1.type").String(); got != "image_url" {
+		t.Fatalf("content.1.type = %q, want image_url", got)
+	}
+	if got := content.Get("1.image_url.url").String(); got != "data:image/png;base64,abc" {
+		t.Fatalf("content.1.image_url.url = %q", got)
+	}
+	if got := content.Get("1.image_url.detail").String(); got != "high" {
+		t.Fatalf("content.1.image_url.detail = %q, want high", got)
+	}
+}

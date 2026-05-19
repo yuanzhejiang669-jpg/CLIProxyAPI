@@ -365,6 +365,36 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponseToClaude_StreamFirstChunkRoleAndContent(t *testing.T) {
+	originalRequest := []byte(`{"stream":true}`)
+	var param any
+
+	outputs := ConvertOpenAIResponseToClaude(
+		context.Background(),
+		"test-model",
+		originalRequest,
+		nil,
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`),
+		&param,
+	)
+
+	foundText := false
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() == "content_block_delta" && data.Get("delta.text").String() == "hello" {
+				foundText = true
+			}
+		}
+	}
+	if !foundText {
+		t.Fatalf("expected first role+content chunk to emit text delta; outputs=%q", outputs)
+	}
+}
+
 func TestConvertOpenAIResponseToClaude_StreamRemovesEmptyOptionalToolArguments(t *testing.T) {
 	originalRequest := []byte(`{"stream":true,"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"pages":{"type":"string"},"limit":{"type":"number"},"offset":{"type":"number"}},"required":["file_path"]}}]}`)
 	var param any

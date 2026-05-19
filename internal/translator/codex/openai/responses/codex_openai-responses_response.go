@@ -3,6 +3,7 @@ package responses
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 
 	"github.com/tidwall/gjson"
 )
@@ -30,5 +31,13 @@ func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, _ string,
 		return []byte{}
 	}
 	responseResult := rootResult.Get("response")
-	return []byte(responseResult.Raw)
+	if responseResult.Raw != "" {
+		return []byte(responseResult.Raw)
+	}
+	if responseResult.Exists() {
+		if data, err := json.Marshal(responseResult.Value()); err == nil {
+			return data
+		}
+	}
+	return []byte{}
 }

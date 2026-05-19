@@ -264,7 +264,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 func appendCodexFunctionCallStart(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, callID, name string) []byte {
 	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-	template, _ = sjson.SetBytes(template, "content_block.id", util.SanitizeClaudeToolID(callID))
+	template, _ = sjson.SetBytes(template, "content_block.id", shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(callID)))
 	template, _ = sjson.SetBytes(template, "content_block.name", resolveClaudeToolName(originalRequestRawJSON, name))
 	output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
 
